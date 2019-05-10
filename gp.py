@@ -5,8 +5,49 @@ import scipy as sc
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
 
+###############################################################################
+def mat_sqrt(C, cholesky=False):
+    if cholesky:
+#         print('cholesky decomposition on ', self.cholesky)
+        return np.linalg.cholesky(C)
+    return sc.linalg.sqrtm(C)
 
-# ##############################################################################
+def mat_square(L, cholesky=False):
+    if cholesky:
+        return L @ L.T
+    return L @ L
+
+def is_hermitian(A, epsilon=1e-7):
+    if np.linalg.norm(A.H - A) < epsilon:
+        return True
+    return False
+
+def is_symmetric(a, rtol=1e-05, atol=1e-08):
+    return np.allclose(a, a.T, rtol=rtol, atol=atol)
+
+def is_psd(A, epsilon=1e-7, pd=True, cholesky_test=False):
+    if cholesky_test:
+        try:
+            np.linalg.cholesky(A)
+            return True
+        except:
+            return False
+            
+    else:
+        if is_symmetric(A):
+            eigvals = np.linalg.eigvalsh(A)
+            real_part_of_eigvals = np.real(eigvals)
+        else:
+            eigvals = np.linalg.eigvals((A+A.T)/2)
+            real_part_of_eigvals = np.real(eigvals)
+
+        if pd is True:
+#             print("real part of eigvals = ", real_part_of_eigvals)
+#             print("eigvals = ", eigvals)
+            return np.all(real_part_of_eigvals>0)
+        else:
+            return np.all(real_part_of_eigvals>=0)
+###############################################################################
 def partitionXX(X, Y, n):
     # assuming X is NxD, y is Nx1
     N, D = X.shape
@@ -73,13 +114,17 @@ def plot_dgp(X, m, C, fm, fC, training_points=None, full=True):
 # ##############################################################################
 
 
-def multivariateGaussianDraw(mean, cov):
-    sample = np.zeros((mean.shape[0], ))  # This is only a placeholder
+def multivariateGaussianDraw(mean, cov, ndraws = 1):
+    
+    #samples = np.zeros((mean.shape[0], ))  # This is only a placeholder
     # Task 2:
     # TODO: Implement a draw from a multivariate Gaussian here
-    sample = np.random.multivariate_normal(mean, cov)
+    samples = np.random.multivariate_normal(mean, cov, ndraws)
     # Return drawn sample
-    return sample.reshape(-1,)
+    if ndraws == 1:
+        return samples.reshape(-1,)
+    else:
+        return samples
 
 # ##############################################################################
 # RadialBasisFunction for the kernel function
