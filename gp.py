@@ -4,6 +4,311 @@ import numpy as np
 import scipy as sc
 import matplotlib.pyplot as plt
 from scipy.optimize import minimize
+from tqdm import tqdm
+###############################################################################
+from sklearn.cluster import KMeans
+from matplotlib import cm
+from matplotlib.ticker import LinearLocator, FormatStrFormatter
+from mpl_toolkits.mplot3d import Axes3D
+from matplotlib import cm
+from matplotlib.ticker import LinearLocator, FormatStrFormatter
+
+def gp_plot2D(Xtest_grid, X2, m2, C2=None):
+    [Xi, Xj] = Xtest_grid
+    # Setup plot environment
+    fig = plt.figure(figsize=(20, 10))
+
+    # Left plot shows mean of GP fit
+    fig.add_subplot(221)
+
+    # Plot mean surface
+    plt.contour(Xi, Xj, m2.reshape(Xi.shape))
+    # Show sample locations
+    plt.plot(X2[:,0],X2[:,1],'o'), plt.axis("square")
+    # Annotate plot
+    plt.xlabel("$x_1$"), plt.ylabel("$x_2$")
+    plt.title("Mean of GP fit"), plt.colorbar()
+
+    # Right plot shows the variance of the GP
+    fig.add_subplot(222)    
+    # Plot variance surface
+    if C2 is not None:
+        plt.pcolor(Xi, Xj, np.diag(C2).reshape(Xi.shape))
+    # Show sample locations
+    plt.plot(X2[:,0],X2[:,1],'o'), plt.axis("square")
+    # Annotate plot
+    plt.xlabel("$x_1$"), plt.ylabel("$x_2$")
+    plt.title("Variance of GP fit")
+    if C2 is not None:
+        plt.colorbar()
+        
+    fig.add_subplot(223)    
+    im = plt.imshow(m2.reshape(Xi.shape), cmap=cm.RdBu)  # drawing the function
+    # adding the Contour lines with labels
+    cset = plt.contour(m2.reshape(Xi.shape), np.arange(-1, 1.5, 0.2), linewidths=2, cmap=cm.Set2)
+    plt.clabel(cset, inline=True, fmt='%1.1f', fontsize=10)
+    plt.colorbar(im)  # adding the colobar on the right
+    # latex fashion title
+    plt.title('colorplot')
+    
+    ax = fig.add_subplot(224, projection='3d')
+       
+    surf = ax.plot_surface(Xi, Xj, m2.reshape(Xi.shape), rstride=1, cstride=1, 
+                          cmap=cm.RdBu,linewidth=0, antialiased=False)
+
+    ax.zaxis.set_major_locator(LinearLocator(10))
+    ax.zaxis.set_major_formatter(FormatStrFormatter('%.02f'))
+
+    fig.colorbar(surf, shrink=0.5, aspect=5)
+
+def partition_data(X, y, n, random=False):
+    # assuming X is NxD, y is Nx1
+    N, D = X.shape
+    assert len(y) == N
+
+    indexes = dict()
+
+    if not random:
+        kmeans_idx = KMeans(n_clusters=n).fit_predict(X)
+        for i in range(n):
+            indexes[i] = (kmeans_idx == i)
+    else:  # random partition
+        list_ = np.arange(N)
+        i = 0
+        k = N//n
+        r = N%n
+        seed = np.random.randint(0, 1000)
+        np.random.np.random.seed(seed)
+        while i < n:
+            if i < r:
+                partition = np.random.choice(list_, k+1, replace=False)
+                indexes[i] = partition
+                list_ = list(set(list_) - set(partition))
+            else:
+                partition = np.random.choice(list_, k, replace=False)
+                indexes[i] = partition
+                list_ = list(set(list_) - set(partition))
+            i += 1
+    return indexes
+
+def create_full_gp(X,y):
+    params = np.array([0, np.log(0.1 + 0.01), 0])
+    kernel = RadialBasisFunction(params)
+    fgp = GaussianProcessRegression(X, y, kernel)
+    opt_params = fgp.optimize(params, True);
+    fgp.KMat(X, opt_params)
+    return fgp
+
+class DistributedGPRegression():
+    def __init__(self, X, y, n, random_partition=False):
+        self.n = n  # number of experts
+        self.X = X
+        self.y = y
+        self.random_partition = random_partition
+        self.indexes = None
+        self.Experts = []
+        self.create_experts()
+
+    def create_experts(self):
+        self.Experts = []
+        N, D = self.X.shape
+        self.indexes = partition_data(
+            self.X, self.y, self.n, self.random_partition)
+        for i in tqdm(range(self.n)):
+            params = np.array([0, np.log(0.1 + 0.01*i), 0])
+            kernel = RadialBasisFunction(params)
+            Xi = self.X[self.indexes[i]]
+            yi = self.y[self.indexes[i]]
+            gp = GaussianProcessRegression(Xi, yi, kernel)
+            self.Experts.append(gp)
+#             plt.plot(Xi, yi, 'x')
+
+    def set_random_partition(self, val=True):
+        self.random_partition = val
+        self.create_experts()
+
+    def logMl(self, params=None):
+        f = 0.
+        for i in range(self.n):
+            f = f + self.Experts[i].logMarginalLikelihood(params)
+        return f
+
+    def gradLogMl(self, params=None):
+        gradf = 0.
+        for i in range(self.n):
+            gradf = gradf + self.Experts[i].gradLogMarginalLikelihood(params)
+        return gradf
+
+    # Optimize the sum of log-marginal likelihood
+    def train(self, display=False, pretrained=None):
+        if pretrained is None:
+            params = np.random.randn(3,)
+            res = minimize(self.logMl, params, method='BFGS',
+                           jac=self.gradLogMl, options={'disp': display})
+            opt_params = res.x
+        else:
+            opt_params = pretrained
+        # update the experts
+        for i in range(self.n):
+            self.Experts[i].KMat(params=opt_params)
+
+    def experts_preds(self, Xa, sqrt=False):
+        """returns the predictions m, Cov of the experts on data Xa
+           for the Cov the square root will be returned if sqrt is True
+        """
+        preds = []
+        for i in range(self.n):
+            m_k, cov_k = self.Experts[i].predict(Xa)
+#             print('expert {} pred: m{},cov{}'.format(i, m_k.shape, cov_k.shape))
+            assert is_symmetric(cov_k)
+            assert is_psd(cov_k, cholesky_test=True)
+            if sqrt:
+                L_k = mat_sqrt(cov_k)
+                preds.append((m_k, L_k))
+            else:
+                preds.append((m_k, cov_k))
+        return preds
+
+    def gbarycenter(self, Xa, ksi='default'):
+        N, D = Xa.shape
+        preds = self.experts_preds(Xa)
+        if ksi is 'default':
+            ksi = np.ones((self.n, N))/self.n
+            
+        elif ksi is 'opt':
+            ksi = np.zeros((self.n, N))
+            # prior covariance of matrix of Xa
+            sigma_ss = self.Experts[0].k.sigma2_f
+            for j in range(self.n):
+                sigma_k_s = np.diag(preds[j][1])
+                ksi[j] = 0.5 * (np.log(sigma_ss) - np.log(sigma_k_s))
+            ksi /= ksi.sum(0)
+            assert ((ksi.sum(0)-1) < 1e-7).all()
+        m = np.zeros(N)
+        for j in range(self.n):
+#             print("shapes ", N,  m.shape, ksi[j].shape, preds[j][0].shape)
+            m += ksi[j] * preds[j][0]
+            
+        sigma2 = self.fixed_point_K(preds, N, ksi)
+        C = sigma2 * np.identity(N)
+        return m, C  # sigma2
+
+    def fixed_point_K(self, preds, N, ksi, eps=1e-6, verbose=False):
+        # initialisations
+        # sigma^2 squared
+        sigma2_current = np.random.random(N)
+        precision = eps + 1
+        # number of iterations
+        n_iter = 0
+        if verbose:
+            print('starting iterations...')
+        while precision > eps and n_iter < 100:
+            sigma = np.sqrt(sigma2_current)
+            Sum = np.zeros(N)  # , dtype='complex128')
+            for j in range(self.n):
+                sigma2_j = np.diag(preds[j][1])
+                sKs = sigma * sigma2_j * sigma
+                Sum += ksi[j] * np.sqrt(sKs)
+            # endfor
+#             sigma2_new =  Sum
+            sigma2_new = (1/sigma) * Sum**2 * (1/sigma)
+            precision = np.linalg.norm(sigma2_new - sigma2_current)
+            sigma2_current = sigma2_new
+            n_iter += 1
+            if verbose:
+                print('n_iter: ', n_iter, ', precision: ', precision)
+        # end while
+        if verbose:
+            print('final n_iter: ', n_iter, ', precision: ', precision)
+        return sigma2_current
+
+    def predict_poe(self, Xa):
+        N, D = Xa.shape
+        sigma_star = np.zeros(N)
+        sum_star = np.zeros(N)
+        for i in range(self.n):
+            m_k, cov_k = self.Experts[i].predict(Xa)
+            # invert the diagonal of cov
+            inv_diag = 1/np.diag(cov_k)
+            sigma_star = sigma_star + inv_diag
+            sum_star = sum_star + inv_diag * m_k
+
+        sigma_star = 1 / sigma_star
+#         print("mean_sigma* = ", sigma_star.mean(),
+#               ", std_sigma* = ", sigma_star.std())
+        cov_star = sigma_star * np.identity(N)
+        m_star = sigma_star * sum_star
+        return m_star.flatten(), cov_star
+
+    def predict_gpoe(self, Xa, betas='default'):
+        if betas is 'default':
+            betas = np.ones(self.n)
+        N, D = Xa.shape
+        sigma_star = np.zeros(N)
+        sum_star = np.zeros((N))
+        for i in range(self.n):
+            m_k, cov_k = self.Experts[i].predict(Xa)
+            inv_diag = 1/np.diag(cov_k)
+            sigma_star = sigma_star + betas[i]*inv_diag
+            sum_star = sum_star + betas[i]*m_k * inv_diag
+
+        sigma_star = 1 / sigma_star
+#         print("mean_sigma* = ", sigma_star.mean(),
+#               ", std_sigma* = ", sigma_star.std())
+        m_star = sigma_star * sum_star
+        cov_star = sigma_star * np.identity(N)
+        return m_star.flatten(), cov_star
+
+    def predict_bcm(self, Xa):
+        N, D = Xa.shape
+        sigma_star = np.zeros(N)
+        sum_star = np.zeros(N)
+        for i in range(self.n):
+            m_k, cov_k = self.Experts[i].predict(Xa)
+            # invert the diagonal of cov
+            inv_diag = 1/np.diag(cov_k)
+            sigma_star = sigma_star + inv_diag
+            sum_star = sum_star + m_k * inv_diag
+            #
+        sigma_prior = np.diag(self.Experts[0].k.covMatrix(Xa))
+        sigma_star = sigma_star + (1-self.n)/sigma_prior
+        sigma_star = 1/sigma_star
+#         print("mean_sigma* = ", sigma_star.mean(),
+#               ", std_sigma* = ", sigma_star.std())
+        m_star = sigma_star * sum_star
+        cov_star = sigma_star * np.identity(N)
+        return m_star, cov_star
+
+    def predict_rbcm(self, Xa):
+        N, D = Xa.shape
+        sigma_star = np.zeros(N)
+        sum_star = np.zeros(N)
+        sigma_prior = np.diag(self.Experts[0].k.covMatrix(Xa))
+        bconst = 0.5 * np.log(sigma_prior)
+        sum_betas = 0
+        for i in range(self.n):
+            m_k, cov_k = self.Experts[i].predict(Xa)
+            # invert the diagonal of cov
+            inv_diag = 1/np.diag(cov_k)
+            beta = bconst - 0.5 * np.log(np.diag(cov_k))
+            sum_betas = sum_betas + beta
+            sigma_star = sigma_star + beta * inv_diag
+            sum_star = sum_star + beta * m_k * inv_diag
+            #
+
+        sigma_star = sigma_star + (1-sum_betas) * (1/sigma_prior)
+        sigma_star = 1/sigma_star
+#         print("mean_sigma* = ", sigma_star.mean(),
+#               ", std_sigma* = ", sigma_star.std())
+        m_star = sigma_star * sum_star
+        cov_star = sigma_star * np.identity(N)
+        return m_star, cov_star
+    #mean squared error
+    def mse(self, ya, fbar):
+        return self.Experts[0].mse(ya,fbar)
+    #mean standardised log loss or  mean (negative) log predictive density
+    def msll(self, ya, fbar, cov):
+        return self.Experts[0].msll(ya, fbar, cov)
 
 ###############################################################################
 def mat_sqrt(C, cholesky=False):
@@ -47,20 +352,8 @@ def is_psd(A, epsilon=1e-7, pd=True, cholesky_test=False):
             return np.all(real_part_of_eigvals>0)
         else:
             return np.all(real_part_of_eigvals>=0)
-###############################################################################
-def partitionXX(X, Y, n):
-    # assuming X is NxD, y is Nx1
-    N, D = X.shape
-    X_p = np.zeros((n, N//n, D))
-    Y_p = np.zeros((n, N//n, 1))
-    for i in range(n):
-        X_p[i] = X[i*(N//n): (i+1)*(N//n)]
-        Y_p[i] = Y[i*(N//n): (i+1)*(N//n)]
 
-    return X_p, Y_p
 ################################################################################
-
-
 def plot_gp(X, m, C, training_points=None):
     """ Plotting utility to plot a GP fit with 95% confidence interval """
     # Plot 95% confidence interval
@@ -200,7 +493,7 @@ class GaussianProcessRegression():
     def __init__(self, X, y, k):
         self.X = X
         self.n = X.shape[0]
-        self.y = y
+        self.y = y.reshape(-1,1)
         self.k = k
         self.K = self.KMat(self.X)
         self.L = np.linalg.cholesky(self.K)
@@ -209,7 +502,9 @@ class GaussianProcessRegression():
     # Recomputes the covariance matrix and the inverse covariance
     # matrix when new hyperparameters are provided.
     # ##########################################################################
-    def KMat(self, X, params=None):
+    def KMat(self, X=None, params=None):
+        if X is None:
+            X = self.X
         if params is not None:
             self.k.setParams(params)
         K = self.k.covMatrix(X)
